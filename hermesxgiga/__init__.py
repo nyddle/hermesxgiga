@@ -2,9 +2,7 @@
 
 from .bot import ChatEngine, HermesBot, Transport
 from .gigachat import (
-    DEFAULT_API_URL,
     DEFAULT_MODEL,
-    DEFAULT_OAUTH_URL,
     DEFAULT_SCOPE,
     GigaChatClient,
     GigaChatError,
@@ -22,8 +20,6 @@ __all__ = [
     "GigaChatError",
     "Message",
     "ConsoleTransport",
-    "DEFAULT_API_URL",
-    "DEFAULT_OAUTH_URL",
     "DEFAULT_SCOPE",
     "DEFAULT_MODEL",
     "__version__",

@@ -1,38 +1,35 @@
-"""Minimal GigaChat API client (OAuth2 + chat completions).
+"""GigaChat client backed by the official ai-forever/gigachat SDK.
 
-GigaChat is Sber's LLM. Authentication is a two-step OAuth flow:
+This is a thin adapter over :class:`gigachat.GigaChat`. The official SDK
+already handles the OAuth2 token exchange, token caching/refresh, the
+Russian "Trusted" TLS chain and streaming, so this class only:
 
-1. Exchange an "Authorization Key" (base64 of ``client_id:client_secret``)
-   for a short-lived access token at the NGW OAuth endpoint.
-2. Call the chat completions endpoint with ``Authorization: Bearer <token>``.
+* maps our public :class:`Message` / dict format onto the SDK payload,
+* validates input,
+* exposes a stable ``chat(messages) -> str`` surface (the ``ChatEngine``
+  protocol :class:`hermesxgiga.bot.HermesBot` depends on),
+* normalises SDK exceptions into :class:`GigaChatError`.
 
-Sber serves these endpoints behind the "Russian Trusted" root CA, which is
-usually not in the default trust store, so TLS verification can be disabled
-or pointed at a custom CA bundle.
+The SDK is imported lazily so ``import hermesxgiga`` works without it, and
+so tests can inject a fake client.
 """
 
 from __future__ import annotations
 
-import time
-import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Iterable, List, Optional, Sequence, Union
 
-import requests
-
-DEFAULT_OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
-DEFAULT_API_URL = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
 DEFAULT_SCOPE = "GIGACHAT_API_PERS"
 DEFAULT_MODEL = "GigaChat"
 
 
 class GigaChatError(RuntimeError):
-    """Raised when the GigaChat API returns an error or an unexpected payload."""
+    """Raised when the underlying GigaChat call fails."""
 
 
 @dataclass
 class Message:
-    """A single chat message in the OpenAI-style ``role``/``content`` format."""
+    """A single chat message in the ``role``/``content`` format."""
 
     role: str
     content: str
@@ -41,106 +38,73 @@ class Message:
         return {"role": self.role, "content": self.content}
 
 
-# Anything the client accepts as a list of messages.
 MessageLike = Union[Message, dict]
 
 
-@dataclass
-class _Token:
-    value: str
-    expires_at: float  # epoch seconds
-
-    def is_valid(self, *, leeway: float = 30.0) -> bool:
-        return bool(self.value) and time.time() < (self.expires_at - leeway)
-
-
 class GigaChatClient:
-    """Synchronous GigaChat client with automatic token caching/refresh.
+    """Adapter over the official ``gigachat.GigaChat`` SDK.
 
     Parameters
     ----------
     auth_key:
         The base64-encoded ``client_id:client_secret`` issued by Sber
-        (shown in the GigaChat portal as the "Authorization Key").
+        (the "Authorization Key" from the GigaChat portal). Passed to the
+        SDK as ``credentials``.
     scope:
-        API scope: ``GIGACHAT_API_PERS`` (personal), ``GIGACHAT_API_B2B``
-        or ``GIGACHAT_API_CORP``.
+        ``GIGACHAT_API_PERS`` (personal), ``GIGACHAT_API_B2B`` or
+        ``GIGACHAT_API_CORP``.
     model:
-        Default model name used when a request does not override it.
+        Default model name.
     verify_ssl:
-        Passed to ``requests`` for both calls. ``False`` disables TLS
-        verification; a string is treated as a path to a CA bundle.
+        ``bool`` -> SDK ``verify_ssl_certs``. A ``str`` is treated as a
+        path to a CA bundle -> SDK ``ca_bundle_file``.
+    client:
+        Pre-built ``gigachat.GigaChat``-like object. When given, the SDK
+        is not imported/instantiated (used by tests and advanced setups).
+    **sdk_kwargs:
+        Forwarded verbatim to ``gigachat.GigaChat(...)``.
     """
 
     def __init__(
         self,
-        auth_key: str,
+        auth_key: str = "",
         *,
         scope: str = DEFAULT_SCOPE,
         model: str = DEFAULT_MODEL,
         verify_ssl: Union[bool, str] = True,
-        oauth_url: str = DEFAULT_OAUTH_URL,
-        api_url: str = DEFAULT_API_URL,
-        timeout: float = 30.0,
-        session: Optional[requests.Session] = None,
+        client: Optional[object] = None,
+        **sdk_kwargs,
     ) -> None:
-        if not auth_key:
-            raise ValueError("auth_key is required")
-        self.auth_key = auth_key
         self.scope = scope
         self.model = model
-        self.verify_ssl = verify_ssl
-        self.oauth_url = oauth_url
-        self.api_url = api_url
-        self.timeout = timeout
-        self._session = session or requests.Session()
-        self._token: Optional[_Token] = None
 
-    # -- auth -----------------------------------------------------------------
+        if client is not None:
+            self._giga = client
+            return
 
-    def _fetch_token(self) -> _Token:
-        headers = {
-            "Authorization": f"Basic {self.auth_key}",
-            "RqUID": str(uuid.uuid4()),
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-        }
+        if not auth_key:
+            raise ValueError("auth_key is required")
+
         try:
-            resp = self._session.post(
-                self.oauth_url,
-                headers=headers,
-                data={"scope": self.scope},
-                timeout=self.timeout,
-                verify=self.verify_ssl,
-            )
-        except requests.RequestException as exc:  # pragma: no cover - network
-            raise GigaChatError(f"OAuth request failed: {exc}") from exc
+            from gigachat import GigaChat
+        except ImportError as exc:  # pragma: no cover - depends on env
+            raise ImportError(
+                "the official GigaChat SDK is required: pip install gigachat"
+            ) from exc
 
-        if resp.status_code != 200:
-            raise GigaChatError(
-                f"OAuth failed with status {resp.status_code}: {resp.text}"
-            )
-
-        payload = resp.json()
-        token = payload.get("access_token")
-        if not token:
-            raise GigaChatError(f"OAuth response missing access_token: {payload}")
-
-        # ``expires_at`` is a Unix timestamp in milliseconds. Fall back to a
-        # conservative 25-minute lifetime when it is absent.
-        expires_at_ms = payload.get("expires_at")
-        if expires_at_ms:
-            expires_at = float(expires_at_ms) / 1000.0
+        if isinstance(verify_ssl, str):
+            sdk_kwargs.setdefault("ca_bundle_file", verify_ssl)
         else:
-            expires_at = time.time() + 25 * 60
-        return _Token(value=token, expires_at=expires_at)
+            sdk_kwargs.setdefault("verify_ssl_certs", bool(verify_ssl))
 
-    def _access_token(self, *, force_refresh: bool = False) -> str:
-        if force_refresh or self._token is None or not self._token.is_valid():
-            self._token = self._fetch_token()
-        return self._token.value
+        self._giga = GigaChat(
+            credentials=auth_key,
+            scope=scope,
+            model=model,
+            **sdk_kwargs,
+        )
 
-    # -- chat -----------------------------------------------------------------
+    # -- helpers --------------------------------------------------------------
 
     @staticmethod
     def _normalize(messages: Iterable[MessageLike]) -> List[dict]:
@@ -158,6 +122,21 @@ class GigaChatClient:
             raise ValueError("messages must not be empty")
         return out
 
+    @staticmethod
+    def _extract(response: object) -> str:
+        # The SDK returns a pydantic ChatCompletion; be tolerant of a plain
+        # dict too (older versions / fakes).
+        try:
+            if isinstance(response, dict):
+                return response["choices"][0]["message"]["content"]
+            return response.choices[0].message.content  # type: ignore[attr-defined]
+        except (KeyError, IndexError, AttributeError, TypeError) as exc:
+            raise GigaChatError(
+                f"Unexpected chat response shape: {response!r}"
+            ) from exc
+
+    # -- chat -----------------------------------------------------------------
+
     def chat(
         self,
         messages: Sequence[MessageLike],
@@ -166,52 +145,34 @@ class GigaChatClient:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
     ) -> str:
-        """Send a chat request and return the assistant's reply text.
-
-        On a ``401`` the access token is refreshed once and the request is
-        retried, which transparently handles token expiry.
-        """
-
-        body: dict = {
+        """Send a chat request and return the assistant's reply text."""
+        payload: dict = {
             "model": model or self.model,
             "messages": self._normalize(messages),
-            "stream": False,
         }
         if temperature is not None:
-            body["temperature"] = temperature
+            payload["temperature"] = temperature
         if max_tokens is not None:
-            body["max_tokens"] = max_tokens
+            payload["max_tokens"] = max_tokens
 
-        for attempt in range(2):
-            token = self._access_token(force_refresh=attempt == 1)
-            try:
-                resp = self._session.post(
-                    self.api_url,
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "Content-Type": "application/json",
-                        "Accept": "application/json",
-                    },
-                    json=body,
-                    timeout=self.timeout,
-                    verify=self.verify_ssl,
-                )
-            except requests.RequestException as exc:  # pragma: no cover - network
-                raise GigaChatError(f"Chat request failed: {exc}") from exc
+        try:
+            response = self._giga.chat(payload)
+        except GigaChatError:
+            raise
+        except Exception as exc:  # SDK/transport/auth errors -> stable surface
+            raise GigaChatError(f"GigaChat request failed: {exc}") from exc
 
-            if resp.status_code == 401 and attempt == 0:
-                continue  # token likely expired; refresh and retry once
-            if resp.status_code != 200:
-                raise GigaChatError(
-                    f"Chat failed with status {resp.status_code}: {resp.text}"
-                )
+        return self._extract(response)
 
-            payload = resp.json()
-            try:
-                return payload["choices"][0]["message"]["content"]
-            except (KeyError, IndexError, TypeError) as exc:
-                raise GigaChatError(
-                    f"Unexpected chat response shape: {payload}"
-                ) from exc
+    # -- resource management --------------------------------------------------
 
-        raise GigaChatError("Chat failed: unauthorized after token refresh")
+    def close(self) -> None:
+        close = getattr(self._giga, "close", None)
+        if callable(close):
+            close()
+
+    def __enter__(self) -> "GigaChatClient":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()

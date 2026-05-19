@@ -11,13 +11,17 @@ Python-библиотека/клиент, связывающая **GigaChat** (L
 pip install -e .
 ```
 
-Зависимость одна — `requests`.
+Зависимость одна — официальный SDK [`gigachat`](https://github.com/ai-forever/gigachat)
+от ai-forever.
 
 ## Компоненты
 
-- `GigaChatClient` — синхронный клиент GigaChat: OAuth2 (обмен Authorization
-  Key на access token), кэширование токена с авто-обновлением, чат-комплишены,
-  повтор запроса при `401`.
+- `GigaChatClient` — тонкий адаптер над официальным `gigachat.GigaChat`.
+  Сам SDK решает OAuth2, кэш/ротацию токена, TLS-цепочку Минцифры и
+  стриминг; адаптер лишь маппит формат сообщений, валидирует ввод и
+  приводит ошибки SDK к `GigaChatError`. SDK импортируется лениво —
+  `import hermesxgiga` работает и без него (например, в тестах с
+  инъекцией клиента через `GigaChatClient(client=...)`).
 - `HermesBot` — оркестратор: хранит историю диалога по `chat_id`,
   подставляет системный промпт, обрезает историю до лимита.
 - `Transport` — протокол транспорта (`send` + `run`). В комплекте
@@ -62,7 +66,8 @@ pip install -e ".[dev]"
 pytest
 ```
 
-Тесты не ходят в сеть — HTTP GigaChat замокан.
+Тесты не ходят в сеть и не требуют установленного `gigachat` — в
+`GigaChatClient` инъектится фейковый SDK-клиент.
 
 ## Области (`scope`)
 
