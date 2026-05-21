@@ -11,8 +11,10 @@ Python-библиотека/клиент, связывающая **GigaChat** (L
 pip install -e .
 ```
 
-Зависимость одна — официальный SDK [`gigachat`](https://github.com/ai-forever/gigachat)
-от ai-forever.
+Базовая зависимость одна — официальный SDK
+[`gigachat`](https://github.com/ai-forever/gigachat) от ai-forever.
+OpenAI-совместимый сервер для агента Hermes ставится отдельным extra:
+`pip install -e ".[server]"` (добавляет FastAPI + uvicorn).
 
 ## Компоненты
 
@@ -26,6 +28,11 @@ pip install -e .
   подставляет системный промпт, обрезает историю до лимита.
 - `Transport` — протокол транспорта (`send` + `run`). В комплекте
   `ConsoleTransport`; свои адаптеры (Telegram/Hermes) реализуют тот же протокол.
+- OpenAI-совместимый сервер (`hermesxgiga.server`) — поднимает endpoint
+  `/v1/chat/completions` и `/v1/models` поверх GigaChat, чтобы внешний
+  агент [Hermes](https://github.com/nousresearch/hermes-agent) (и любой
+  OpenAI-клиент) ходил в GigaChat без правок кода. Поддерживает
+  tool/function calling, выбор модели и стриминг (SSE).
 
 ## Быстрый старт
 
@@ -58,6 +65,43 @@ class MyTransport:
         for chat_id, text in incoming_messages():
             handler(chat_id, text)   # handler сам вызовет send()
 ```
+
+## Подключение агента Hermes к GigaChat
+
+[Hermes](https://github.com/nousresearch/hermes-agent) общается с моделью
+через OpenAI-совместимый endpoint. GigaChat такого API не отдаёт, поэтому
+`hermesxgiga` поднимает тонкий прокси-сервер, который Hermes указывает как
+`base_url`. Сервер транслирует протоколы в обе стороны: OpenAI `tools` /
+`tool_calls` ↔ GigaChat `functions` / `function_call`, роль `tool` ↔
+`function`, JSON-строка аргументов ↔ объект, плюс стриминг (SSE).
+
+```bash
+pip install -e ".[server]"
+
+export GIGACHAT_AUTH_KEY="<base64 client_id:client_secret>"
+export GIGACHAT_VERIFY_SSL=0            # или GIGACHAT_CA_BUNDLE=/path/to/ca.pem
+export GIGACHAT_MODEL="GigaChat-Pro"    # модель по умолчанию
+# export HERMESXGIGA_API_KEY=secret     # включить проверку Authorization (опц.)
+
+python -m hermesxgiga.server --host 127.0.0.1 --port 8000
+# либо: hermesxgiga-server
+```
+
+Затем в `~/.hermes/config.yaml`:
+
+```yaml
+model:
+  provider: custom
+  base_url: "http://127.0.0.1:8000/v1"
+  api_key: "local"          # любое значение; проверяется, только если задан HERMESXGIGA_API_KEY
+  model: "GigaChat-Pro"     # GigaChat / GigaChat-Pro / GigaChat-Max / GigaChat-2-...
+```
+
+Сменить модель на лету — `hermes model` или поле `model` в запросе:
+сервер прокидывает его в GigaChat. Список доступных моделей — `GET /v1/models`.
+
+Эндпоинты: `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`
+(с `"stream": true` и без).
 
 ## Тесты
 

@@ -12,7 +12,11 @@ license = { text = "MIT" }
 dependencies = ["gigachat>=0.1.30"]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+server = ["fastapi>=0.110", "uvicorn>=0.27"]
+dev = ["pytest>=7.0", "fastapi>=0.110", "uvicorn>=0.27", "httpx>=0.27"]
+
+[project.scripts]
+hermesxgiga-server = "hermesxgiga.server:main"
 
 [tool.setuptools.packages.find]
 include = ["hermesxgiga*"]

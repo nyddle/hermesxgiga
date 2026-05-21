@@ -17,7 +17,7 @@ so tests can inject a fake client.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Sequence, Union
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Union
 
 DEFAULT_SCOPE = "GIGACHAT_API_PERS"
 DEFAULT_MODEL = "GigaChat"
@@ -123,6 +123,21 @@ class GigaChatClient:
         return out
 
     @staticmethod
+    def _to_dict(obj: object) -> Any:
+        """Coerce an SDK pydantic model (or anything) into plain JSON types."""
+        if obj is None or isinstance(obj, (str, int, float, bool)):
+            return obj
+        if isinstance(obj, dict):
+            return obj
+        model_dump = getattr(obj, "model_dump", None)
+        if callable(model_dump):  # pydantic v2: JSON mode coerces enums to str
+            return model_dump(mode="json")
+        as_dict = getattr(obj, "dict", None)
+        if callable(as_dict):  # pydantic v1 fallback
+            return as_dict()
+        return obj
+
+    @staticmethod
     def _extract(response: object) -> str:
         # The SDK returns a pydantic ChatCompletion; be tolerant of a plain
         # dict too (older versions / fakes).
@@ -135,6 +150,36 @@ class GigaChatClient:
                 f"Unexpected chat response shape: {response!r}"
             ) from exc
 
+    def _build_payload(
+        self,
+        messages: Sequence[MessageLike],
+        *,
+        model: Optional[str],
+        temperature: Optional[float],
+        max_tokens: Optional[int],
+        top_p: Optional[float] = None,
+        functions: Optional[Sequence[dict]] = None,
+        function_call: Optional[Union[str, dict]] = None,
+        stream: bool = False,
+    ) -> dict:
+        payload: Dict[str, Any] = {
+            "model": model or self.model,
+            "messages": self._normalize(messages),
+        }
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+        if top_p is not None:
+            payload["top_p"] = top_p
+        if functions:
+            payload["functions"] = list(functions)
+        if function_call is not None:
+            payload["function_call"] = function_call
+        if stream:
+            payload["stream"] = True
+        return payload
+
     # -- chat -----------------------------------------------------------------
 
     def chat(
@@ -146,23 +191,96 @@ class GigaChatClient:
         max_tokens: Optional[int] = None,
     ) -> str:
         """Send a chat request and return the assistant's reply text."""
-        payload: dict = {
-            "model": model or self.model,
-            "messages": self._normalize(messages),
-        }
-        if temperature is not None:
-            payload["temperature"] = temperature
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
+        payload = self._build_payload(
+            messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return self._extract(self._call(payload))
 
+    def complete(
+        self,
+        messages: Sequence[MessageLike],
+        *,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
+        functions: Optional[Sequence[dict]] = None,
+        function_call: Optional[Union[str, dict]] = None,
+    ) -> dict:
+        """Send a chat request and return the full response as a plain dict.
+
+        Unlike :meth:`chat`, this exposes ``function_call``, ``finish_reason``
+        and ``usage`` so callers (e.g. the OpenAI-compatible server) can map
+        tool calls. The shape mirrors the GigaChat SDK ``ChatCompletion``.
+        """
+        payload = self._build_payload(
+            messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            functions=functions,
+            function_call=function_call,
+        )
+        return self._to_dict(self._call(payload))
+
+    def stream(
+        self,
+        messages: Sequence[MessageLike],
+        *,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
+        functions: Optional[Sequence[dict]] = None,
+        function_call: Optional[Union[str, dict]] = None,
+    ) -> Iterator[dict]:
+        """Stream a chat response, yielding each chunk as a plain dict."""
+        payload = self._build_payload(
+            messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            functions=functions,
+            function_call=function_call,
+            stream=True,
+        )
         try:
-            response = self._giga.chat(payload)
+            for chunk in self._giga.stream(payload):
+                yield self._to_dict(chunk)
+        except GigaChatError:
+            raise
+        except Exception as exc:  # SDK/transport/auth errors -> stable surface
+            raise GigaChatError(f"GigaChat stream failed: {exc}") from exc
+
+    def list_models(self) -> List[str]:
+        """Return the ids of models available to these credentials."""
+        try:
+            models = self._to_dict(self._giga.get_models())
+        except GigaChatError:
+            raise
+        except Exception as exc:
+            raise GigaChatError(f"GigaChat get_models failed: {exc}") from exc
+        data = models.get("data", []) if isinstance(models, dict) else []
+        ids: List[str] = []
+        for item in data:
+            item = self._to_dict(item)
+            mid = item.get("id_") or item.get("id") if isinstance(item, dict) else None
+            if mid:
+                ids.append(mid)
+        return ids
+
+    def _call(self, payload: dict) -> object:
+        try:
+            return self._giga.chat(payload)
         except GigaChatError:
             raise
         except Exception as exc:  # SDK/transport/auth errors -> stable surface
             raise GigaChatError(f"GigaChat request failed: {exc}") from exc
-
-        return self._extract(response)
 
     # -- resource management --------------------------------------------------
 
