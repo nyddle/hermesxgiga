@@ -103,6 +103,30 @@ model:
 Эндпоинты: `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`
 (с `"stream": true` и без).
 
+### Готовый провайдер-профиль для Hermes
+
+В Hermes провайдеры — это плагины-профили (`plugins/model-providers/<name>/`),
+а транспорт всегда OpenAI-совместимый (`api_mode = "chat_completions"`).
+Поэтому напрямую профилем к GigaChat не подключиться — он указывает на наш
+прокси. Готовый профиль лежит в `hermes_plugin/gigachat/`:
+
+```bash
+cp -r hermes_plugin/gigachat "$HERMES_HOME/plugins/model-providers/gigachat"
+# по умолчанию HERMES_HOME=~/.hermes
+
+hermes model gigachat/GigaChat-Pro
+```
+
+Профиль по умолчанию смотрит на `http://127.0.0.1:8000/v1`. Переопределить:
+
+```bash
+export GIGACHAT_PROXY_BASE_URL="http://my-host:8000/v1"
+export GIGACHAT_PROXY_API_KEY="secret"   # должен совпадать с HERMESXGIGA_API_KEY прокси
+```
+
+Тогда `provider: custom` в `config.yaml` не нужен — Hermes видит `gigachat`
+как обычного провайдера со своим списком моделей.
+
 ## Тесты
 
 ```bash

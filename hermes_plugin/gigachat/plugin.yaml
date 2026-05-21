@@ -1,0 +1,5 @@
+name: gigachat-provider
+kind: model-provider
+version: 1.0.0
+description: GigaChat (Sber) via the local hermesxgiga OpenAI-compatible proxy
+author: hermesxgiga
