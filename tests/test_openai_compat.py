@@ -1,6 +1,8 @@
+import asyncio
 import json
 
 from hermesxgiga.openai_compat import (
+    ato_openai_stream,
     to_gigachat_function_call,
     to_gigachat_functions,
     to_gigachat_messages,
@@ -177,3 +179,24 @@ def test_stream_function_call_chunk():
     assert tool_delta["function"]["name"] == "weather"
     assert json.loads(tool_delta["function"]["arguments"]) == {"city": "Moscow"}
     assert out[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_async_stream_matches_sync():
+    giga_chunks = [
+        {"choices": [{"index": 0, "delta": {"content": "Hel"}, "finish_reason": None}]},
+        {"choices": [{"index": 0, "delta": {"content": "lo"}, "finish_reason": None}]},
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+    ]
+
+    async def agen():
+        for c in giga_chunks:
+            yield c
+
+    async def collect():
+        return [c async for c in ato_openai_stream(agen(), model="GigaChat", completion_id="x", created=5)]
+
+    out = asyncio.run(collect())
+    expected = list(to_openai_stream(iter(giga_chunks), model="GigaChat", completion_id="x", created=5))
+    assert out == expected
+    assert out[0]["choices"][0]["delta"] == {"role": "assistant"}
+    assert out[-1]["choices"][0]["finish_reason"] == "stop"

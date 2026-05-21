@@ -10,7 +10,7 @@ from hermesxgiga.server import create_app  # noqa: E402
 
 
 class FakeClient:
-    """Stands in for GigaChatClient at the server boundary."""
+    """Stands in for GigaChatClient at the (async) server boundary."""
 
     model = "GigaChat"
 
@@ -28,15 +28,16 @@ class FakeClient:
             {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
         ]
 
-    def complete(self, messages, **kwargs):
+    async def acomplete(self, messages, **kwargs):
         self.complete_calls.append((messages, kwargs))
         return self.complete_result
 
-    def stream(self, messages, **kwargs):
+    async def astream(self, messages, **kwargs):
         self.stream_calls.append((messages, kwargs))
-        yield from self.stream_result
+        for chunk in self.stream_result:
+            yield chunk
 
-    def list_models(self):
+    async def alist_models(self):
         return ["GigaChat", "GigaChat-Pro"]
 
 
@@ -115,10 +116,10 @@ def test_missing_messages_is_400():
 def test_upstream_error_is_502():
     fake, client = make_client()
 
-    def boom(messages, **kwargs):
+    async def boom(messages, **kwargs):
         raise GigaChatError("down")
 
-    fake.complete = boom
+    fake.acomplete = boom
     resp = client.post(
         "/v1/chat/completions", json={"messages": [{"role": "user", "content": "x"}]}
     )

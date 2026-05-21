@@ -17,7 +17,17 @@ so tests can inject a fake client.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Union
+from typing import (
+    Any,
+    AsyncIterator,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Union,
+)
 
 DEFAULT_SCOPE = "GIGACHAT_API_PERS"
 DEFAULT_MODEL = "GigaChat"
@@ -265,10 +275,14 @@ class GigaChatClient:
             raise
         except Exception as exc:
             raise GigaChatError(f"GigaChat get_models failed: {exc}") from exc
+        return self._model_ids(models)
+
+    @staticmethod
+    def _model_ids(models: object) -> List[str]:
         data = models.get("data", []) if isinstance(models, dict) else []
         ids: List[str] = []
         for item in data:
-            item = self._to_dict(item)
+            item = GigaChatClient._to_dict(item)
             mid = item.get("id_") or item.get("id") if isinstance(item, dict) else None
             if mid:
                 ids.append(mid)
@@ -282,6 +296,81 @@ class GigaChatClient:
         except Exception as exc:  # SDK/transport/auth errors -> stable surface
             raise GigaChatError(f"GigaChat request failed: {exc}") from exc
 
+    # -- async chat -----------------------------------------------------------
+
+    async def acomplete(
+        self,
+        messages: Sequence[MessageLike],
+        *,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
+        functions: Optional[Sequence[dict]] = None,
+        function_call: Optional[Union[str, dict]] = None,
+    ) -> dict:
+        """Async variant of :meth:`complete` using the SDK's ``achat``.
+
+        The SDK handles the OAuth token cache/refresh asynchronously, so this
+        never blocks the event loop.
+        """
+        payload = self._build_payload(
+            messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            functions=functions,
+            function_call=function_call,
+        )
+        try:
+            response = await self._giga.achat(payload)
+        except GigaChatError:
+            raise
+        except Exception as exc:  # SDK/transport/auth errors -> stable surface
+            raise GigaChatError(f"GigaChat request failed: {exc}") from exc
+        return self._to_dict(response)
+
+    async def astream(
+        self,
+        messages: Sequence[MessageLike],
+        *,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
+        functions: Optional[Sequence[dict]] = None,
+        function_call: Optional[Union[str, dict]] = None,
+    ) -> AsyncIterator[dict]:
+        """Async variant of :meth:`stream` using the SDK's ``astream``."""
+        payload = self._build_payload(
+            messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            functions=functions,
+            function_call=function_call,
+            stream=True,
+        )
+        try:
+            async for chunk in self._giga.astream(payload):
+                yield self._to_dict(chunk)
+        except GigaChatError:
+            raise
+        except Exception as exc:  # SDK/transport/auth errors -> stable surface
+            raise GigaChatError(f"GigaChat stream failed: {exc}") from exc
+
+    async def alist_models(self) -> List[str]:
+        """Async variant of :meth:`list_models`."""
+        try:
+            models = self._to_dict(await self._giga.aget_models())
+        except GigaChatError:
+            raise
+        except Exception as exc:
+            raise GigaChatError(f"GigaChat get_models failed: {exc}") from exc
+        return self._model_ids(models)
+
     # -- resource management --------------------------------------------------
 
     def close(self) -> None:
@@ -289,8 +378,21 @@ class GigaChatClient:
         if callable(close):
             close()
 
+    async def aclose(self) -> None:
+        aclose = getattr(self._giga, "aclose", None)
+        if callable(aclose):
+            await aclose()
+        else:
+            self.close()
+
     def __enter__(self) -> "GigaChatClient":
         return self
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+    async def __aenter__(self) -> "GigaChatClient":
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self.aclose()

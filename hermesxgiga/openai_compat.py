@@ -19,7 +19,17 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import (
+    Any,
+    AsyncIterable,
+    AsyncIterator,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+)
 
 __all__ = [
     "to_gigachat_messages",
@@ -27,6 +37,7 @@ __all__ = [
     "to_gigachat_function_call",
     "to_openai_response",
     "to_openai_stream",
+    "ato_openai_stream",
     "new_completion_id",
 ]
 
@@ -242,6 +253,86 @@ def to_openai_response(
     return out
 
 
+class _StreamTranslator:
+    """Incremental GigaChat -> OpenAI stream translation.
+
+    Stateful so a sync (:func:`to_openai_stream`) or async
+    (:func:`ato_openai_stream`) driver can share identical logic.
+    """
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        completion_id: Optional[str] = None,
+        created: Optional[int] = None,
+    ) -> None:
+        self.model = model
+        self.cid = completion_id or new_completion_id()
+        self.ts = created or int(time.time())
+        self.role_sent = False
+        self.final_reason: Optional[str] = None
+
+    def _envelope(self, delta: dict, finish_reason: Optional[str]) -> dict:
+        return {
+            "id": self.cid,
+            "object": "chat.completion.chunk",
+            "created": self.ts,
+            "model": self.model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+
+    def feed(self, chunk: dict) -> List[dict]:
+        """Translate one GigaChat chunk into zero or more OpenAI chunks."""
+        choices = chunk.get("choices") or []
+        if not choices:
+            return []
+        choice = choices[0]
+        delta = choice.get("delta") or {}
+        reason = _finish_reason(choice.get("finish_reason"))
+        if reason is not None:
+            self.final_reason = reason
+
+        out: List[dict] = []
+        if not self.role_sent:
+            out.append(self._envelope({"role": "assistant"}, None))
+            self.role_sent = True
+
+        fc = delta.get("function_call")
+        if fc:
+            out.append(
+                self._envelope(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_" + uuid.uuid4().hex[:24],
+                                "type": "function",
+                                "function": {
+                                    "name": fc.get("name", ""),
+                                    "arguments": _arguments_to_str(fc.get("arguments")),
+                                },
+                            }
+                        ]
+                    },
+                    None,
+                )
+            )
+            if self.final_reason is None:
+                self.final_reason = "tool_calls"
+        elif delta.get("content"):
+            out.append(self._envelope({"content": delta["content"]}, None))
+        return out
+
+    def finish(self) -> List[dict]:
+        """Emit the trailing chunk(s) after the upstream stream ends."""
+        out: List[dict] = []
+        if not self.role_sent:  # empty stream — still emit a well-formed start
+            out.append(self._envelope({"role": "assistant"}, None))
+        out.append(self._envelope({}, self.final_reason or "stop"))
+        return out
+
+
 def to_openai_stream(
     chunks: Iterable[dict],
     *,
@@ -254,59 +345,25 @@ def to_openai_stream(
     Emits an initial role delta, then content/tool-call deltas, and a final
     chunk carrying ``finish_reason``.
     """
-    cid = completion_id or new_completion_id()
-    ts = created or int(time.time())
-    role_sent = False
-    final_reason: Optional[str] = None
-
-    def envelope(delta: dict, finish_reason: Optional[str]) -> dict:
-        return {
-            "id": cid,
-            "object": "chat.completion.chunk",
-            "created": ts,
-            "model": model,
-            "choices": [
-                {"index": 0, "delta": delta, "finish_reason": finish_reason}
-            ],
-        }
-
+    t = _StreamTranslator(model=model, completion_id=completion_id, created=created)
     for chunk in chunks:
-        choices = chunk.get("choices") or []
-        if not choices:
-            continue
-        choice = choices[0]
-        delta = choice.get("delta") or {}
-        reason = _finish_reason(choice.get("finish_reason"))
-        if reason is not None:
-            final_reason = reason
+        for out in t.feed(chunk):
+            yield out
+    for out in t.finish():
+        yield out
 
-        if not role_sent:
-            yield envelope({"role": "assistant"}, None)
-            role_sent = True
 
-        fc = delta.get("function_call")
-        if fc:
-            yield envelope(
-                {
-                    "tool_calls": [
-                        {
-                            "index": 0,
-                            "id": "call_" + uuid.uuid4().hex[:24],
-                            "type": "function",
-                            "function": {
-                                "name": fc.get("name", ""),
-                                "arguments": _arguments_to_str(fc.get("arguments")),
-                            },
-                        }
-                    ]
-                },
-                None,
-            )
-            if final_reason is None:
-                final_reason = "tool_calls"
-        elif delta.get("content"):
-            yield envelope({"content": delta["content"]}, None)
-
-    if not role_sent:  # empty stream — still emit a well-formed start
-        yield envelope({"role": "assistant"}, None)
-    yield envelope({}, final_reason or "stop")
+async def ato_openai_stream(
+    chunks: AsyncIterable[dict],
+    *,
+    model: str,
+    completion_id: Optional[str] = None,
+    created: Optional[int] = None,
+) -> AsyncIterator[dict]:
+    """Async variant of :func:`to_openai_stream` over an async chunk source."""
+    t = _StreamTranslator(model=model, completion_id=completion_id, created=created)
+    async for chunk in chunks:
+        for out in t.feed(chunk):
+            yield out
+    for out in t.finish():
+        yield out

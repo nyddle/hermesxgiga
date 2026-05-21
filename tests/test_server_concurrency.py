@@ -1,8 +1,8 @@
-"""Verify blocking GigaChat calls don't stall the event loop.
+"""Verify the async server stays responsive while a request is in flight.
 
-A slow (blocking) ``complete`` must run in a worker thread so other requests
-(here ``/health``) stay responsive. Without the threadpool offload the async
-endpoint would block the loop and ``/health`` would wait for the full sleep.
+The endpoints are async-native (SDK ``achat``/``astream``), so a slow upstream
+call must yield the event loop and let other requests (here ``/health``) run
+concurrently rather than serialize behind it.
 """
 
 import asyncio
@@ -17,21 +17,21 @@ import httpx  # noqa: E402
 
 from hermesxgiga.server import create_app  # noqa: E402
 
-BLOCK_SECONDS = 0.5
+SLOW_SECONDS = 0.5
 
 
 class SlowClient:
     model = "GigaChat"
 
-    def complete(self, messages, **kwargs):
-        time.sleep(BLOCK_SECONDS)  # blocking, like a real network call
+    async def acomplete(self, messages, **kwargs):
+        await asyncio.sleep(SLOW_SECONDS)  # slow upstream I/O, but non-blocking
         return {
             "choices": [
                 {"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
             ]
         }
 
-    def list_models(self):
+    async def alist_models(self):
         return ["GigaChat"]
 
 
@@ -60,5 +60,5 @@ def test_blocking_completion_does_not_stall_health():
 
     assert health.status_code == 200
     assert chat_resp.status_code == 200
-    # /health must return well before the blocking sleep finishes
-    assert health_latency < BLOCK_SECONDS / 2
+    # /health must return well before the slow upstream call finishes
+    assert health_latency < SLOW_SECONDS / 2

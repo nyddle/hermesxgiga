@@ -1,3 +1,4 @@
+import asyncio
 import types
 
 import pytest
@@ -102,3 +103,87 @@ def test_context_manager_closes_underlying_client():
     with GigaChatClient(client=giga) as client:
         client.chat([Message("user", "x")])
     assert giga.closed is True
+
+
+class FakeAsyncGiga:
+    """Async duck-typed stand-in for gigachat.GigaChat."""
+
+    def __init__(self, result=None, chunks=None, models=None, error=None):
+        self._result = result if result is not None else completion("ok")
+        self._chunks = chunks or []
+        self._models = models
+        self._error = error
+        self.payloads = []
+        self.aclosed = False
+
+    async def achat(self, payload):
+        self.payloads.append(payload)
+        if self._error is not None:
+            raise self._error
+        return self._result
+
+    async def astream(self, payload):
+        self.payloads.append(payload)
+        if self._error is not None:
+            raise self._error
+        for c in self._chunks:
+            yield c
+
+    async def aget_models(self):
+        return self._models
+
+    async def aclose(self):
+        self.aclosed = True
+
+
+def test_acomplete_returns_dict_and_builds_payload():
+    giga = FakeAsyncGiga({"choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}]})
+    client = GigaChatClient(client=giga, model="GigaChat-Pro")
+
+    out = asyncio.run(
+        client.acomplete([Message("user", "x")], functions=[{"name": "f"}], function_call="auto")
+    )
+    assert out["choices"][0]["message"]["content"] == "hi"
+    assert giga.payloads[0]["model"] == "GigaChat-Pro"
+    assert giga.payloads[0]["functions"] == [{"name": "f"}]
+    assert giga.payloads[0]["function_call"] == "auto"
+
+
+def test_astream_yields_chunk_dicts():
+    chunks = [
+        {"choices": [{"delta": {"content": "a"}, "finish_reason": None}]},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+    ]
+    giga = FakeAsyncGiga(chunks=chunks)
+    client = GigaChatClient(client=giga)
+
+    async def collect():
+        return [c async for c in client.astream([Message("user", "x")])]
+
+    out = asyncio.run(collect())
+    assert out == chunks
+    assert giga.payloads[0]["stream"] is True
+
+
+def test_acomplete_wraps_errors():
+    giga = FakeAsyncGiga(error=RuntimeError("boom"))
+    client = GigaChatClient(client=giga)
+    with pytest.raises(GigaChatError, match="GigaChat request failed: boom"):
+        asyncio.run(client.acomplete([Message("user", "x")]))
+
+
+def test_alist_models_extracts_ids():
+    giga = FakeAsyncGiga(models={"data": [{"id_": "GigaChat"}, {"id": "GigaChat-Pro"}]})
+    client = GigaChatClient(client=giga)
+    assert asyncio.run(client.alist_models()) == ["GigaChat", "GigaChat-Pro"]
+
+
+def test_async_context_manager_closes_underlying_client():
+    giga = FakeAsyncGiga()
+
+    async def scenario():
+        async with GigaChatClient(client=giga) as client:
+            await client.acomplete([Message("user", "x")])
+
+    asyncio.run(scenario())
+    assert giga.aclosed is True

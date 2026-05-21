@@ -28,18 +28,17 @@ from typing import Optional
 
 from .gigachat import GigaChatClient, GigaChatError
 from .openai_compat import (
+    ato_openai_stream,
     new_completion_id,
     to_gigachat_function_call,
     to_gigachat_functions,
     to_gigachat_messages,
     to_openai_response,
-    to_openai_stream,
 )
 
 try:  # optional dependency group: [server]
     from fastapi import Depends, FastAPI, Header, HTTPException, Request
     from fastapi.responses import JSONResponse, StreamingResponse
-    from starlette.concurrency import run_in_threadpool
 except ImportError as exc:  # pragma: no cover - depends on env
     raise ImportError(
         'the OpenAI-compatible server needs FastAPI/uvicorn: '
@@ -88,9 +87,9 @@ def create_app(
         return {"status": "ok"}
 
     @app.get("/v1/models", dependencies=[Depends(auth)])
-    def list_models() -> dict:
+    async def list_models() -> dict:
         try:
-            ids = client.list_models()
+            ids = await client.alist_models()
         except GigaChatError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
         return {
@@ -133,10 +132,7 @@ def create_app(
             return _stream_response(client, giga_messages, model, kwargs)
 
         try:
-            # The GigaChat SDK call is blocking; keep it off the event loop.
-            giga_response = await run_in_threadpool(
-                lambda: client.complete(giga_messages, **kwargs)
-            )
+            giga_response = await client.acomplete(giga_messages, **kwargs)
         except GigaChatError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
         return JSONResponse(to_openai_response(giga_response, model=model))
@@ -148,10 +144,10 @@ def _stream_response(client, giga_messages, model, kwargs):
     cid = new_completion_id()
     created = int(time.time())
 
-    def event_stream():
+    async def event_stream():
         try:
-            giga_chunks = client.stream(giga_messages, **kwargs)
-            for chunk in to_openai_stream(
+            giga_chunks = client.astream(giga_messages, **kwargs)
+            async for chunk in ato_openai_stream(
                 giga_chunks, model=model, completion_id=cid, created=created
             ):
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
