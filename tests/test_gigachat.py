@@ -92,9 +92,17 @@ def test_empty_and_bad_messages_rejected():
         client.chat([{"role": "user"}])
 
 
-def test_missing_auth_key_rejected_without_injected_client():
-    with pytest.raises(ValueError, match="auth_key is required"):
+def test_missing_auth_rejected_without_injected_client():
+    with pytest.raises(ValueError, match="auth_key, user/password"):
         GigaChatClient("")
+
+
+def test_user_password_auth_constructs_real_sdk():
+    # Smoke: no network, just check the SDK is instantiated and the
+    # adapter wires user/password (not credentials) into the kwargs.
+    client = GigaChatClient(user="u", password="p", verify_ssl=False)
+    assert client._giga.__class__.__module__.startswith("gigachat")
+    client.close()
 
 
 def test_context_manager_closes_underlying_client():

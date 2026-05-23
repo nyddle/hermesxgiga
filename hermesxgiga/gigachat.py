@@ -47,12 +47,17 @@ class GigaChatClient:
     Parameters
     ----------
     auth_key:
-        The base64-encoded ``client_id:client_secret`` issued by Sber
-        (the "Authorization Key" from the GigaChat portal). Passed to the
-        SDK as ``credentials``.
+        Base64-encoded ``client_id:client_secret`` ("Authorization Key"
+        from the GigaChat portal). Mapped to the SDK's ``credentials``.
+    user, password:
+        Alternative auth: GigaChat ``user``/``password`` pair. Either
+        ``auth_key``, ``user``+``password`` or ``access_token`` must be
+        supplied.
+    access_token:
+        Alternative auth: pre-issued Bearer access token.
     scope:
         ``GIGACHAT_API_PERS`` (personal), ``GIGACHAT_API_B2B`` or
-        ``GIGACHAT_API_CORP``.
+        ``GIGACHAT_API_CORP``. ``None`` lets the SDK decide.
     model:
         Default model name.
     verify_ssl:
@@ -69,7 +74,10 @@ class GigaChatClient:
         self,
         auth_key: str = "",
         *,
-        scope: str = DEFAULT_SCOPE,
+        user: Optional[str] = None,
+        password: Optional[str] = None,
+        access_token: Optional[str] = None,
+        scope: Optional[str] = None,
         model: str = DEFAULT_MODEL,
         verify_ssl: Union[bool, str] = True,
         client: Optional[object] = None,
@@ -82,8 +90,13 @@ class GigaChatClient:
             self._giga = client
             return
 
-        if not auth_key:
-            raise ValueError("auth_key is required")
+        has_creds = bool(auth_key)
+        has_userpw = bool(user) and bool(password)
+        has_token = bool(access_token)
+        if not (has_creds or has_userpw or has_token):
+            raise ValueError(
+                "provide one of: auth_key, user/password, or access_token"
+            )
 
         try:
             from gigachat import GigaChat
@@ -97,12 +110,18 @@ class GigaChatClient:
         else:
             sdk_kwargs.setdefault("verify_ssl_certs", bool(verify_ssl))
 
-        self._giga = GigaChat(
-            credentials=auth_key,
-            scope=scope,
-            model=model,
-            **sdk_kwargs,
-        )
+        init_kwargs: dict = {"model": model, **sdk_kwargs}
+        if has_creds:
+            init_kwargs["credentials"] = auth_key
+        if has_userpw:
+            init_kwargs["user"] = user
+            init_kwargs["password"] = password
+        if has_token:
+            init_kwargs["access_token"] = access_token
+        if scope is not None:
+            init_kwargs["scope"] = scope
+
+        self._giga = GigaChat(**init_kwargs)
 
     # -- helpers --------------------------------------------------------------
 
