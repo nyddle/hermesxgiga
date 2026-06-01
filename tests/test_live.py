@@ -17,7 +17,7 @@ import os
 
 import pytest
 
-from hermesxgiga import GigaChatClient, HermesBot, Message
+from hermesxgiga import GigaChatClient, HermesBot, Message, Tool
 
 
 def _have_creds() -> bool:
@@ -63,3 +63,44 @@ def test_live_bot_two_turns():
         second = bot.handle("live", "А Германии?")
     assert first.strip()
     assert second.strip()
+
+
+def test_live_streaming():
+    with _client() as client:
+        deltas = list(
+            client.stream_chat([Message("user", "Назови три цвета через запятую.")])
+        )
+    assert deltas, "expected at least one streamed delta"
+    assert "".join(deltas).strip()
+
+
+def test_live_function_calling():
+    calls = []
+
+    def get_weather(args):
+        calls.append(args)
+        return {"city": args.get("city"), "temp_c": 7, "condition": "облачно"}
+
+    tool = Tool(
+        name="get_weather",
+        description="Возвращает текущую погоду в указанном городе.",
+        parameters={
+            "type": "object",
+            "properties": {"city": {"type": "string", "description": "Город"}},
+            "required": ["city"],
+        },
+        handler=get_weather,
+    )
+    with _client() as client:
+        bot = HermesBot(
+            client,
+            system_prompt=(
+                "Если спрашивают про погоду — вызови функцию get_weather "
+                "и ответь по её данным."
+            ),
+            tools=[tool],
+        )
+        answer = bot.handle("live", "Какая сейчас погода в Москве?")
+    assert calls, "model did not invoke the get_weather tool"
+    assert calls[0].get("city")
+    assert answer.strip()

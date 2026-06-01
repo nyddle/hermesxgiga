@@ -17,7 +17,7 @@ so tests can inject a fake client.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Sequence, Union
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Union
 
 DEFAULT_SCOPE = "GIGACHAT_API_PERS"
 DEFAULT_MODEL = "GigaChat"
@@ -29,13 +29,44 @@ class GigaChatError(RuntimeError):
 
 @dataclass
 class Message:
-    """A single chat message in the ``role``/``content`` format."""
+    """A single chat message.
+
+    ``content`` is optional because an assistant message that requests a
+    function call carries ``function_call`` instead of text. ``name`` labels
+    a ``role="function"`` result message with the function it answers.
+    """
 
     role: str
-    content: str
+    content: Optional[str] = None
+    name: Optional[str] = None
+    function_call: Optional[dict] = None
 
     def as_dict(self) -> dict:
-        return {"role": self.role, "content": self.content}
+        d: dict = {"role": self.role}
+        if self.content is not None:
+            d["content"] = self.content
+        if self.name is not None:
+            d["name"] = self.name
+        if self.function_call is not None:
+            d["function_call"] = self.function_call
+        return d
+
+
+@dataclass
+class ToolCall:
+    """A function/tool invocation requested by the model."""
+
+    name: str
+    arguments: dict
+
+
+@dataclass
+class ChatResult:
+    """A single assistant turn: either text, or a tool call, or both."""
+
+    content: Optional[str]
+    tool_call: Optional[ToolCall] = None
+    functions_state_id: Optional[str] = None
 
 
 MessageLike = Union[Message, dict]
@@ -134,7 +165,11 @@ class GigaChatClient:
             elif isinstance(m, dict):
                 if "role" not in m or "content" not in m:
                     raise ValueError(f"message dict needs role/content: {m!r}")
-                out.append({"role": m["role"], "content": m["content"]})
+                d = {"role": m["role"], "content": m["content"]}
+                for k in ("name", "function_call"):
+                    if m.get(k) is not None:
+                        d[k] = m[k]
+                out.append(d)
             else:  # pragma: no cover - defensive
                 raise TypeError(f"unsupported message type: {type(m)!r}")
         if not out:
@@ -142,19 +177,106 @@ class GigaChatClient:
         return out
 
     @staticmethod
-    def _extract(response: object) -> str:
+    def _to_result(response: object) -> ChatResult:
         # The SDK returns a pydantic ChatCompletion; be tolerant of a plain
         # dict too (older versions / fakes).
         try:
             if isinstance(response, dict):
-                return response["choices"][0]["message"]["content"]
-            return response.choices[0].message.content  # type: ignore[attr-defined]
+                msg = response["choices"][0]["message"]
+                content = msg.get("content")
+                raw_fc = msg.get("function_call")
+                fsid = msg.get("functions_state_id")
+            else:
+                msg = response.choices[0].message  # type: ignore[attr-defined]
+                content = getattr(msg, "content", None)
+                raw_fc = getattr(msg, "function_call", None)
+                fsid = getattr(msg, "functions_state_id", None)
         except (KeyError, IndexError, AttributeError, TypeError) as exc:
             raise GigaChatError(
                 f"Unexpected chat response shape: {response!r}"
             ) from exc
 
+        tool_call = None
+        if raw_fc:
+            if isinstance(raw_fc, dict):
+                name = raw_fc.get("name")
+                args = raw_fc.get("arguments")
+            else:
+                name = getattr(raw_fc, "name", None)
+                args = getattr(raw_fc, "arguments", None)
+            if name:
+                tool_call = ToolCall(name=name, arguments=args or {})
+        return ChatResult(content=content, tool_call=tool_call, functions_state_id=fsid)
+
+    @staticmethod
+    def _chunk_text(chunk: object) -> str:
+        try:
+            if isinstance(chunk, dict):
+                delta = chunk["choices"][0]["delta"]
+                return delta.get("content") or ""
+            return chunk.choices[0].delta.content or ""  # type: ignore[attr-defined]
+        except (KeyError, IndexError, AttributeError, TypeError):
+            return ""
+
+    def _build_payload(
+        self,
+        messages: Sequence[MessageLike],
+        *,
+        model: Optional[str],
+        functions: Optional[Sequence[dict]],
+        function_call: Optional[Any],
+        temperature: Optional[float],
+        max_tokens: Optional[int],
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "model": model or self.model,
+            "messages": self._normalize(messages),
+        }
+        if functions is not None:
+            payload["functions"] = list(functions)
+        if function_call is not None:
+            payload["function_call"] = function_call
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+        return payload
+
     # -- chat -----------------------------------------------------------------
+
+    def complete(
+        self,
+        messages: Sequence[MessageLike],
+        *,
+        functions: Optional[Sequence[dict]] = None,
+        function_call: Optional[Any] = None,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> ChatResult:
+        """Send a chat request and return the assistant turn.
+
+        Unlike :meth:`chat`, this surfaces a function/tool call when the model
+        asks for one (``ChatResult.tool_call``). Pass ``functions`` (GigaChat
+        function schemas) to enable tool calling; ``function_call`` may be
+        ``"auto"``, ``"none"`` or ``{"name": ...}``.
+        """
+        payload = self._build_payload(
+            messages,
+            model=model,
+            functions=functions,
+            function_call=function_call,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        try:
+            response = self._giga.chat(payload)
+        except GigaChatError:
+            raise
+        except Exception as exc:  # SDK/transport/auth errors -> stable surface
+            raise GigaChatError(f"GigaChat request failed: {exc}") from exc
+
+        return self._to_result(response)
 
     def chat(
         self,
@@ -165,23 +287,50 @@ class GigaChatClient:
         max_tokens: Optional[int] = None,
     ) -> str:
         """Send a chat request and return the assistant's reply text."""
-        payload: dict = {
-            "model": model or self.model,
-            "messages": self._normalize(messages),
-        }
-        if temperature is not None:
-            payload["temperature"] = temperature
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
+        result = self.complete(
+            messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        if result.content is None:
+            raise GigaChatError(
+                f"response has no text content (tool_call={result.tool_call})"
+            )
+        return result.content
 
+    def stream_chat(
+        self,
+        messages: Sequence[MessageLike],
+        *,
+        functions: Optional[Sequence[dict]] = None,
+        function_call: Optional[Any] = None,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> Iterator[str]:
+        """Stream the assistant reply, yielding text deltas as they arrive."""
+        stream = getattr(self._giga, "stream", None)
+        if not callable(stream):
+            raise GigaChatError("underlying client does not support streaming")
+
+        payload = self._build_payload(
+            messages,
+            model=model,
+            functions=functions,
+            function_call=function_call,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
         try:
-            response = self._giga.chat(payload)
+            for chunk in stream(payload):
+                delta = self._chunk_text(chunk)
+                if delta:
+                    yield delta
         except GigaChatError:
             raise
         except Exception as exc:  # SDK/transport/auth errors -> stable surface
-            raise GigaChatError(f"GigaChat request failed: {exc}") from exc
-
-        return self._extract(response)
+            raise GigaChatError(f"GigaChat stream failed: {exc}") from exc
 
     # -- resource management --------------------------------------------------
 
