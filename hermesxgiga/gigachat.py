@@ -332,6 +332,23 @@ class GigaChatClient:
         except Exception as exc:  # SDK/transport/auth errors -> stable surface
             raise GigaChatError(f"GigaChat stream failed: {exc}") from exc
 
+    def list_models(self) -> List[str]:
+        """Return the model ids available in the current contour."""
+        get_models = getattr(self._giga, "get_models", None)
+        if not callable(get_models):
+            raise GigaChatError("underlying client cannot list models")
+        try:
+            models = get_models()
+        except GigaChatError:
+            raise
+        except Exception as exc:
+            raise GigaChatError(f"GigaChat list models failed: {exc}") from exc
+        data = models["data"] if isinstance(models, dict) else models.data
+        out: List[str] = []
+        for m in data:
+            out.append(m["id"] if isinstance(m, dict) else m.id_)
+        return out
+
     # -- resource management --------------------------------------------------
 
     def close(self) -> None:
